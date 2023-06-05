@@ -1,9 +1,7 @@
 use std::{
     collections::HashMap,
     net::SocketAddr,
-    pin::Pin,
     sync::{Arc, Mutex},
-    task::{Context, Poll},
     time::Duration,
 };
 
@@ -27,45 +25,32 @@ pub(crate) type HolePunchMap =
 /// An upgrading inbound QUIC connection that is either
 /// - a normal inbound connection or
 /// - an inbound connection corresponding to an in-progress outbound hole punching connection.
-pub(crate) struct MaybeHolePunchedConnection {
+pub(crate) async fn maybe_hole_punched_connection(
     hole_punch_map: HolePunchMap,
-    addr: SocketAddr,
-    upgrade: Connecting,
-}
-
-impl MaybeHolePunchedConnection {
-    pub(crate) fn new(hole_punch_map: HolePunchMap, addr: SocketAddr, upgrade: Connecting) -> Self {
-        Self {
-            hole_punch_map,
-            addr,
-            upgrade,
-        }
-    }
-}
-
-impl Future for MaybeHolePunchedConnection {
-    type Output = Result<(PeerId, Connection), Error>;
-
-    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let (peer_id, connection) = futures::ready!(self.upgrade.poll_unpin(cx))?;
-        let addr = self.addr;
-        let mut hole_punch_map = self.hole_punch_map.lock().unwrap();
-        if let Some(sender) = hole_punch_map.remove(&(addr, peer_id)) {
-            if let Err(connection) = sender.send((peer_id, connection)) {
-                Poll::Ready(Ok(connection))
-            } else {
-                Poll::Ready(Err(Error::HandshakeTimedOut))
-            }
-        } else {
-            Poll::Ready(Ok((peer_id, connection)))
-        }
-    }
-}
-
-async fn punch_holes(
-    mut endpoint_channel: endpoint::Channel,
     remote_addr: SocketAddr,
-) -> Error {
+    upgrade: Connecting,
+) -> Result<(PeerId, Connection), Error> {
+    upgrade
+        .map(|res| {
+            let (peer_id, connection) = res?;
+            if let Some(sender) = hole_punch_map
+                .lock()
+                .unwrap()
+                .remove(&(remote_addr, peer_id))
+            {
+                if let Err((peer_id, connection)) = sender.send((peer_id, connection)) {
+                    Ok((peer_id, connection))
+                } else {
+                    Err(Error::HandshakeTimedOut)
+                }
+            } else {
+                Ok((peer_id, connection))
+            }
+        })
+        .await
+}
+
+async fn punch_holes(mut endpoint_channel: endpoint::Channel, remote_addr: SocketAddr) -> Error {
     loop {
         let sleep_duration = Duration::from_millis(rand::thread_rng().gen_range(10..=200));
         sleep(sleep_duration).await;
@@ -92,10 +77,7 @@ pub(crate) async fn hole_puncher(
     remote_addr: SocketAddr,
     timeout_duration: Duration,
 ) -> Error {
-    timeout(
-        timeout_duration,
-        punch_holes(endpoint_channel, remote_addr),
-    )
-    .await
-    .unwrap_or(Error::HandshakeTimedOut)
+    timeout(timeout_duration, punch_holes(endpoint_channel, remote_addr))
+        .await
+        .unwrap_or(Error::HandshakeTimedOut)
 }
